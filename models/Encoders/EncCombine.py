@@ -111,16 +111,11 @@ class EncodingCombination(nn.Module):
         num_layers: int = 6,
         dim_feedforward: int = 2048,
         dropout: float = 0.1,
-        initial_modalities: tuple = ("text", "vision"),
         max_latent_tokens: int = 128,
         min_latent_tokens: int = 4,
     ):
         super().__init__()
         self.d_model = d_model
-
-        self.modality_embeddings = nn.ParameterDict()
-        for mod in initial_modalities:
-            self.add_modality(mod)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -142,33 +137,7 @@ class EncodingCombination(nn.Module):
             dropout=dropout,
         )
 
-    def add_modality(self, modality_name: str):
-        if modality_name not in self.modality_embeddings:
-            new_embedding = nn.Parameter(
-                torch.randn(1, 1, self.d_model) * 0.02
-            )
-            self.modality_embeddings[modality_name] = new_embedding
-            print(f"Registered new modality: '{modality_name}'")
-        else:
-            print(f"Modality '{modality_name}' already exists.")
-
-    def forward(self, input_tensors, modality_names=None,
-                padding_masks=None):
-        if modality_names is not None:
-            assert len(input_tensors) == len(modality_names), \
-                "Must provide one modality name per input tensor."
-            enhanced = []
-            for tensor, mod_name in zip(input_tensors, modality_names):
-                if mod_name not in self.modality_embeddings:
-                    raise ValueError(
-                        f"Modality '{mod_name}' not found. "
-                        f"Call add_modality('{mod_name}') first."
-                    )
-                enhanced.append(
-                    tensor + self.modality_embeddings[mod_name]
-                )
-            input_tensors = enhanced
-
+    def forward(self, input_tensors, padding_masks=None):
         total_seq_len = sum(t.size(1) for t in input_tensors)
         combined_seq = torch.cat(input_tensors, dim=1)
         combined_mask = (
@@ -224,7 +193,6 @@ class EncodingCombination(nn.Module):
 # combine = createEncCombine()
 
 # inputs = [img_embeddings[0], img_embeddings[1], vid_embeddings[0], vid_embeddings[1], vid_embeddings[2], vid_embeddings[3], tweet_embeds[0], article_embeds[0]]
-# modalities = ['vision', 'vision', 'vision', 'vision', 'vision', 'vision','text', 'text']
 # print(f"Input shape: {len(inputs)}")
 
 # combinedEnc, num_active = combine(inputs, modalities)

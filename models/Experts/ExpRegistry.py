@@ -11,7 +11,6 @@ def compare(route_vec, expert_embeddings):
     normed = F.normalize(expert_embeddings, dim=-1)
     return route_vec @ normed.T
 
-
 class ExpertRegistry(nn.Module):
     """
     Manages a set of expert modules alongside a learnable embedding

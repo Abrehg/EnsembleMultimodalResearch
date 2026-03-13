@@ -103,6 +103,7 @@ class TextEncoder(nn.Module):
             batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.tokenizer:InputTextTokenizer = createTokenizer()
 
     def _get_1d_sincos_pos_embed(self, seq_len, device):
         pos = torch.arange(seq_len, dtype=torch.float32, device=device)
@@ -113,7 +114,8 @@ class TextEncoder(nn.Module):
         
         return emb.unsqueeze(0)
 
-    def forward(self, input_ids, padding_mask=None):
+    def forward(self, input, padding_mask=None):
+        input_ids, _ = self.tokenizer.tokenize_single(input)
         B, seq_len = input_ids.shape
         device = input_ids.device
         
