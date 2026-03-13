@@ -3,11 +3,14 @@ import torch
 from torch import nn
 from Encoders.TextEncoder import createTextEnc, createTokenizer
 from Encoders.VisionEncoder import createVisionEncoder
+from Encoders.MCP import createMCPEncoder
+from Encoders.EncRegistry import createEncRegistry
 from Encoders.EncCombine import createEncCombine
 from Logic import createRouter
 from Experts.ExpRegistry import create_registry
 from Experts.TextOutput import createTextOutputExpert
-from Encoders.EncRegistry import createEncRegistry
+from Experts.Reasoning import createReasoningExpert
+from Experts.VisionExpert import createVisionGenExpert
 
 class MultimodalModel(nn.Module):
     def __init__(self, max_steps=10, *args, **kwargs):
@@ -18,12 +21,15 @@ class MultimodalModel(nn.Module):
         self.encoder_registry = createEncRegistry()
         self.encoder_registry.add_encoder("text", createTextEnc())
         self.encoder_registry.add_encoder("vision", createVisionEncoder())
+        #self.encoder_registry.add_encoder("mcp", createMCPEncoder())
 
         self.combine = createEncCombine()
         self.router = createRouter()
         self.expert_registry = create_registry()
 
         self.expert_registry.add_expert("text_output", createTextOutputExpert(max_seq_len=20))
+        #self.expert_registry.add_expert("reasoning", createReasoningExpert(num_steps=4))
+        #self.expert_registry.add_expert("vision_gen", createVisionGenExpert())
 
         self.max_steps = max_steps
 
@@ -38,12 +44,9 @@ class MultimodalModel(nn.Module):
         experts_used = []
         for _ in range(self.max_steps):
             routing_vec, state = self.router(combinedEnc)
-            print(f"New state shape: {state.size()}")
-            print(f"Routing vector shape: {routing_vec.size()}")
     
             chosen_expert, scores = self.expert_registry(routing_vec)
             print(f"Expert chosen: {chosen_expert}")
-            print(f"Scores: {scores}")
 
             if chosen_expert == "text_output":
                 experts_used.append(chosen_expert)
@@ -58,6 +61,8 @@ class MultimodalModel(nn.Module):
                 output, state = expert(state)
                 print(f"Next expert output shape: {output.size()}")
                 print(f"New state shape: {state.size()}")
+                if output is not None:
+                    artifacts.append(output)
 
         return "No response given in time", artifacts, experts_used
 
