@@ -28,7 +28,7 @@ class MultimodalModel(nn.Module):
         self.expert_registry = create_registry()
 
         self.expert_registry.add_expert("text_output", createTextOutputExpert(max_seq_len=20))
-        #self.expert_registry.add_expert("reasoning", createReasoningExpert(num_steps=4))
+        self.expert_registry.add_expert("reasoning", createReasoningExpert(num_steps=4))
         #self.expert_registry.add_expert("vision_gen", createVisionGenExpert())
 
         self.max_steps = max_steps
