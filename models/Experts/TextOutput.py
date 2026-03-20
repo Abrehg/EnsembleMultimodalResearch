@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import os
+from Encoders.TextEncoder import createTokenizer
 
 PAD_ID = 0
 BOS_ID = 2
@@ -52,6 +53,13 @@ class TextOutputExpert(nn.Module):
         self.output_proj = nn.Linear(d_model, vocab_size, bias=False)
 
         self.output_proj.weight = self.token_embedding.weight
+        self.tokenizer = createTokenizer()
+
+        self.state_update_attn = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=nhead,
+            dropout=dropout, batch_first=True,
+        )
+        self.state_update_norm = nn.LayerNorm(d_model)
 
     def _sincos_pos_embed(self, seq_len, device):
         pos = torch.arange(seq_len, dtype=torch.float32, device=device)
@@ -70,19 +78,6 @@ class TextOutputExpert(nn.Module):
         )
 
     def forward(self, state, max_length=None, temperature=1.0, top_k=50):
-        """
-        Autoregressively decode the latent state into token IDs.
- 
-        Args:
-            state       : [B, K, d_model]
-            max_length  : cap on generated tokens (defaults to max_seq_len)
-            temperature : sampling temperature (1.0 = unchanged, <1 = sharper)
-            top_k       : keep only top-k logits before sampling (0 = off)
- 
-        Returns:
-            token_ids : [B, T']  — generated token id sequences, pass to
-                                   tokenizer.detokenize() to get strings
-        """
         if max_length is None:
             max_length = self.max_seq_len
  
@@ -105,6 +100,7 @@ class TextOutputExpert(nn.Module):
                 memory=state,
                 tgt_mask=tgt_mask,
             )
+            last_decoded = decoded
  
             logits = self.output_proj(decoded[:, -1, :])
  
@@ -125,7 +121,14 @@ class TextOutputExpert(nn.Module):
             if finished.all():
                 break
  
-        return generated
+        text = self.tokenizer.detokenize(generated, strip_special=False)
+
+        update_out, _ = self.state_update_attn(
+            query=state, key=last_decoded, value=last_decoded
+        )
+        state = self.state_update_norm(state + update_out)
+
+        return text, state
 
     def store_weights(self, path, filename="text_output_expert"):
         os.makedirs(path, exist_ok=True)

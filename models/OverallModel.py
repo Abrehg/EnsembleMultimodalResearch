@@ -1,7 +1,7 @@
 import os
 import torch
 from torch import nn
-from Encoders.TextEncoder import createTextEnc, createTokenizer
+from Encoders.TextEncoder import createTextEnc
 from Encoders.VisionEncoder import createVisionEncoder
 from Encoders.MCP import createMCPEncoder
 from Encoders.EncRegistry import createEncRegistry
@@ -11,12 +11,11 @@ from Experts.ExpRegistry import create_registry
 from Experts.TextOutput import createTextOutputExpert
 from Experts.Reasoning import createReasoningExpert
 from Experts.VisionExpert import createVisionGenExpert
+from Experts.EOS import createEOSExpert
 
 class MultimodalModel(nn.Module):
     def __init__(self, max_steps=10, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
-        self.tokenizer = createTokenizer()
 
         self.encoder_registry = createEncRegistry()
         self.encoder_registry.add_encoder("text", createTextEnc())
@@ -27,8 +26,9 @@ class MultimodalModel(nn.Module):
         self.router = createRouter()
         self.expert_registry = create_registry()
 
+        self.expert_registry.add_expert("eos", createEOSExpert())
         self.expert_registry.add_expert("text_output", createTextOutputExpert(max_seq_len=20))
-        self.expert_registry.add_expert("reasoning", createReasoningExpert(num_steps=4))
+        #self.expert_registry.add_expert("reasoning", createReasoningExpert(num_steps=4))
         #self.expert_registry.add_expert("vision_gen", createVisionGenExpert())
 
         self.max_steps = max_steps
@@ -37,29 +37,23 @@ class MultimodalModel(nn.Module):
         return self.encoder_registry.encode(input, modality, encodings)
     
     def forward(self, encodings):
-        combinedEnc, num_active = self.combine(encodings)
+        combinedEnc, _ = self.combine(encodings)
         print(f"Combined shape: {combinedEnc.size()}")
 
         artifacts = []
         experts_used = []
         for _ in range(self.max_steps):
             routing_vec, state = self.router(combinedEnc)
-    
-            chosen_expert, scores = self.expert_registry(routing_vec)
+            chosen_expert, _ = self.expert_registry(routing_vec)
             print(f"Expert chosen: {chosen_expert}")
 
-            if chosen_expert == "text_output":
+            if chosen_expert == "eos":
                 experts_used.append(chosen_expert)
-                expert = self.expert_registry.get_expert(chosen_expert)
-                output = expert(state)
-                print(f"Text expert output shape: {output.size()}")
-                text = self.tokenizer.detokenize(output, strip_special=False)
-                return text, artifacts, experts_used
+                return artifacts, experts_used
             else:
                 experts_used.append(chosen_expert)
                 expert = self.expert_registry.get_expert(chosen_expert)
                 output, state = expert(state)
-                print(f"Next expert output shape: {output.size()}")
                 print(f"New state shape: {state.size()}")
                 if output is not None:
                     artifacts.append(output)
@@ -127,21 +121,21 @@ class MultimodalModel(nn.Module):
 
         print(f"Weight loading complete from {directory}/")
 
-model = MultimodalModel()
+# model = MultimodalModel()
 
-dummy_image = torch.randn(2, 3, 250, 300)
-encodings = model.encode(dummy_image, 'vision')
+# dummy_image = torch.randn(2, 3, 250, 300)
+# encodings = model.encode(dummy_image, 'vision')
 
-dummy_video = torch.randn(4, 10, 3, 100, 100) 
-encodings = model.encode(dummy_video, 'vision', encodings)
+# dummy_video = torch.randn(4, 10, 3, 100, 100) 
+# encodings = model.encode(dummy_video, 'vision', encodings)
 
-tweet = ["Just set up my new multimodal PyTorch model! 🚀"]
-encodings = model.encode(tweet, 'text', encodings)
+# tweet = ["Just set up my new multimodal PyTorch model! 🚀"]
+# encodings = model.encode(tweet, 'text', encodings)
 
-article = ["PyTorch is an open source machine learning library... " * 100]
-encodings = model.encode(article, 'text', encodings)
+# article = ["PyTorch is an open source machine learning library... " * 100]
+# encodings = model.encode(article, 'text', encodings)
 
-text, artifacts, experts_used = model.forward(encodings)
-print(f"Text output: {text[0]}")
-print(f"Number of artifacts created: {len(artifacts)}")
-print(f"Sequence of used experts: {experts_used}")
+# artifacts, experts_used = model.forward(encodings)
+# print(f"Number of artifacts created: {len(artifacts)}")
+# print(f"All created artifacts: {artifacts}")
+# print(f"Sequence of used experts: {experts_used}")
