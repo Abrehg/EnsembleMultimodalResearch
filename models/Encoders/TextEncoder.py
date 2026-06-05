@@ -42,8 +42,8 @@ def train_production_spm(corpus_file="train_corpus.txt", vocab_size=32000):
 def createTokenizer():
     return InputTextTokenizer()
 
-def createTextEnc():
-    return TextEncoder(vocab_size=32000, embed_dim=512)
+def createTextEnc(dim=512):
+    return TextEncoder(vocab_size=32000, embed_dim=dim // 2, output_dim=dim)
 
 class InputTextTokenizer:
     _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -84,25 +84,27 @@ class InputTextTokenizer:
  
         return results[0] if single else results
     
+# Maybe make the transformer encoder a univeral transformer layer to make it adaptable
 class TextEncoder(nn.Module):
-    def __init__(self, vocab_size, embed_dim=512, num_layers=3):
+    def __init__(self, vocab_size, embed_dim=256, output_dim=512, num_layers=3):
         super().__init__()
         self.embed_dim = embed_dim
-        
+
         self.token_embedding = nn.Embedding(
-            num_embeddings=vocab_size, 
-            embedding_dim=embed_dim, 
+            num_embeddings=vocab_size,
+            embedding_dim=embed_dim,
             padding_idx=0
         )
-        
+
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, 
-            nhead=8, 
-            dim_feedforward=embed_dim * 4, 
+            d_model=embed_dim,
+            nhead=8,
+            dim_feedforward=embed_dim * 4,
             activation="gelu",
             batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.output_proj = nn.Linear(embed_dim, output_dim)
         self.tokenizer:InputTextTokenizer = createTokenizer()
 
     def _get_1d_sincos_pos_embed(self, seq_len, device):
@@ -125,7 +127,7 @@ class TextEncoder(nn.Module):
         x = x + pos_emb
         
         x = self.transformer(x, src_key_padding_mask=padding_mask)
-        
+        x = self.output_proj(x)
         return x
     
     def load_weights(self, filename):

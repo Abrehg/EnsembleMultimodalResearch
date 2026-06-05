@@ -18,30 +18,32 @@ class ResBlock(nn.Module):
         x = self.bn2(self.conv2(x))
         return self.gelu(x + residual)
 
-def createVisionEncoder():
-    return VisionEncoder()
+def createVisionEncoder(dim=512):
+    embed_dim = dim // 2
+    return VisionEncoder(in_channels=3, embed_dim=embed_dim, output_dim=dim, nhead=max(1, embed_dim // 32))
 
 class VisionEncoder(nn.Module):
-    def __init__(self, in_channels=3, embed_dim=512, patch_size=16, internal_layers=3):
+    def __init__(self, in_channels=3, embed_dim=256, output_dim=512, patch_size=16, internal_layers=3, nhead=8):
         super().__init__()
+        assert embed_dim % nhead == 0, f"embed_dim ({embed_dim}) must be divisible by nhead ({nhead})"
         self.patch_size = patch_size
         self.embed_dim = embed_dim
-        
+
         self.deep_stem = nn.Sequential(
             nn.Conv2d(in_channels, 64, kernel_size=3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.GELU(),
-            
+
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(128),
             nn.GELU(),
             ResBlock(128),
-            
+
             nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(256),
             nn.GELU(),
             ResBlock(256),
-            
+
             nn.Conv2d(256, embed_dim, kernel_size=3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(embed_dim),
             nn.GELU(),
@@ -50,13 +52,14 @@ class VisionEncoder(nn.Module):
         )
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, 
-            nhead=8, 
-            dim_feedforward=embed_dim * 4, 
+            d_model=embed_dim,
+            nhead=nhead,
+            dim_feedforward=embed_dim * 4,
             activation="gelu",
             batch_first=True
         )
         self.spatial_contextualizer = nn.TransformerEncoder(encoder_layer, num_layers=internal_layers)
+        self.output_proj = nn.Linear(embed_dim, output_dim)
 
     def _pad_to_multiple(self, x):
         H, W = x.shape[-2:]
@@ -121,7 +124,8 @@ class VisionEncoder(nn.Module):
         features = features + temporal_pos_emb
         
         output = features.reshape(B, -1, self.embed_dim)
-        
+        output = self.output_proj(output)
+
         return output
     
     def load_weights(self, filename):

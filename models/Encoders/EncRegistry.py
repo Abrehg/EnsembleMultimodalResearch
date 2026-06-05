@@ -2,6 +2,8 @@ import os
 import torch
 import torch.nn as nn
 
+def createEncRegistry(dim=512):
+    return EncoderRegistry(d_model=dim)
 def createEncRegistry():
     return EncoderRegistry()
 

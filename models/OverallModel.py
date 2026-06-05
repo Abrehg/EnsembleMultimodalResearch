@@ -3,33 +3,71 @@ import torch
 from torch import nn
 from Encoders.TextEncoder import createTextEnc
 from Encoders.VisionEncoder import createVisionEncoder
-from Encoders.MCP import createMCPEncoder
+from Encoders.LatentState import createLatentStateEncoder
+from Encoders.ShortMemory import createShortMemory
 from Encoders.EncRegistry import createEncRegistry
 from Encoders.EncCombine import createEncCombine
 from Logic import createRouter
 from Experts.ExpRegistry import create_registry
 from Experts.TextOutput import createTextOutputExpert
 from Experts.Reasoning import createReasoningExpert
-from Experts.VisionExpert import createVisionGenExpert
+from Experts.LocalMem import createLocalMemExpert
+from Experts.InternetSearch import createInternetSearchExpert
 from Experts.EOS import createEOSExpert
 
+# Potentially build another encoder that uses previous state in order to build next step in the required task (Ex. for continuing a task)
+# Also build a memory system that can be pulled from for input and added to for output. Will require an overall memory module, an encoder that takes in memory module on initialization, and an expert that also takes in memory on initialization
+"""
+Modality keys
+    Encoders:
+    - Text input: "text"
+    - Vision input: "vision"
+    - Latent state matrix: "latent_state"
+    - Memory block input: "memory"
+    
+    Experts:
+    - End of Sequence: "eos"
+    - Plain text output: "text_output"
+    - Reasoning module: "reasoning"
+"""
 class MultimodalModel(nn.Module):
-    def __init__(self, max_steps=10, *args, **kwargs):
+    def __init__(self, dim=512, max_steps=10, max_memory_entries=16, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.encoder_registry = createEncRegistry()
-        self.encoder_registry.add_encoder("text", createTextEnc())
-        self.encoder_registry.add_encoder("vision", createVisionEncoder())
-        #self.encoder_registry.add_encoder("mcp", createMCPEncoder())
+        self.dim = dim
 
-        self.combine = createEncCombine()
-        self.router = createRouter()
-        self.expert_registry = create_registry()
+        self.encoder_registry = createEncRegistry(dim=dim)
+        self.encoder_registry.add_encoder("text", createTextEnc(dim=dim))
+        self.encoder_registry.add_encoder("vision", createVisionEncoder(dim=dim))
+        self.encoder_registry.add_encoder("latent_state", createLatentStateEncoder(dim=dim))
+        self.memory = createShortMemory(dim=dim, max_entries=max_memory_entries)
+        self.encoder_registry.add_encoder("memory", self.memory)
+        
+        self.combine = createEncCombine(dim=dim)
+        self.router = createRouter(dim=dim)
 
+        self.expert_registry = create_registry(dim=dim)
+        self.expert_registry.set_pipeline(
+            text_encoder=self.encoder_registry.get_encoder("text"),
+            combiner=self.combine,
+            router=self.router,
+        )
         self.expert_registry.add_expert("eos", createEOSExpert())
-        self.expert_registry.add_expert("text_output", createTextOutputExpert(max_seq_len=20))
-        #self.expert_registry.add_expert("reasoning", createReasoningExpert(num_steps=4))
-        #self.expert_registry.add_expert("vision_gen", createVisionGenExpert())
+        self.expert_registry.add_expert("text_output", createTextOutputExpert(max_seq_len=20, d_model=dim))
+        self.expert_registry.add_expert("reasoning", createReasoningExpert(num_steps=4, d_model=dim))
+
+        self.local_mem_expert = createLocalMemExpert(d_model=dim)
+        self.expert_registry.add_expert("local_mem", self.local_mem_expert)
+        self.local_mem_expert.set_encoders(
+            text_encoder=self.encoder_registry.get_encoder("text"),
+            vision_encoder=self.encoder_registry.get_encoder("vision"),
+        )
+
+        self.internet_search_expert = createInternetSearchExpert(d_model=dim)
+        self.expert_registry.add_expert("internet_search", self.internet_search_expert)
+        self.internet_search_expert.set_encoders(
+            text_encoder=self.encoder_registry.get_encoder("text"),
+        )
 
         self.max_steps = max_steps
 
@@ -49,7 +87,7 @@ class MultimodalModel(nn.Module):
 
             if chosen_expert == "eos":
                 experts_used.append(chosen_expert)
-                return artifacts, experts_used
+                return artifacts, state, experts_used
             else:
                 experts_used.append(chosen_expert)
                 expert = self.expert_registry.get_expert(chosen_expert)
@@ -58,7 +96,7 @@ class MultimodalModel(nn.Module):
                 if output is not None:
                     artifacts.append(output)
 
-        return "No response given in time", artifacts, experts_used
+        return artifacts, state, experts_used
 
     def add_encoder(self, name: str, module: nn.Module,
                     modalities: list[str]):
@@ -135,7 +173,7 @@ class MultimodalModel(nn.Module):
 # article = ["PyTorch is an open source machine learning library... " * 100]
 # encodings = model.encode(article, 'text', encodings)
 
-# artifacts, experts_used = model.forward(encodings)
+# artifacts, state, experts_used = model.forward(encodings)
 # print(f"Number of artifacts created: {len(artifacts)}")
 # print(f"All created artifacts: {artifacts}")
 # print(f"Sequence of used experts: {experts_used}")

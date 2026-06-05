@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-def createRouter():
-    return RoutingLogic()
+def createRouter(dim=512):
+    return RoutingLogic(d_model=dim, dim_feedforward=dim * 4, route_dim=dim // 4)
 
 class RoutingLogic(nn.Module):
     def __init__(
