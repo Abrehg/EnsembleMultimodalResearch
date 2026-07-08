@@ -31,18 +31,24 @@ Modality keys
     - Reasoning module: "reasoning"
 """
 class MultimodalModel(nn.Module):
-    def __init__(self, dim=512, max_steps=10, max_memory_entries=16, *args, **kwargs):
+    def __init__(self, dim=512, max_steps=10, max_memory_entries=16,
+                 text_only=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.dim = dim
+        self.text_only = text_only
 
         self.encoder_registry = createEncRegistry(dim=dim)
         self.encoder_registry.add_encoder("text", createTextEnc(dim=dim))
-        self.encoder_registry.add_encoder("vision", createVisionEncoder(dim=dim))
-        self.encoder_registry.add_encoder("latent_state", createLatentStateEncoder(dim=dim))
-        self.memory = createShortMemory(dim=dim, max_entries=max_memory_entries)
-        self.encoder_registry.add_encoder("memory", self.memory)
-        
+        # In text_only mode (e.g. dimension tuning) only the text encoder and the
+        # text-output expert are active; the registries, combination and router
+        # stages are kept intact. The non-text encoders/experts below are skipped.
+        if not text_only:
+            self.encoder_registry.add_encoder("vision", createVisionEncoder(dim=dim))
+            self.encoder_registry.add_encoder("latent_state", createLatentStateEncoder(dim=dim))
+            self.memory = createShortMemory(dim=dim, max_entries=max_memory_entries)
+            self.encoder_registry.add_encoder("memory", self.memory)
+
         self.combine = createEncCombine(dim=dim)
         self.router = createRouter(dim=dim)
 
@@ -54,20 +60,22 @@ class MultimodalModel(nn.Module):
         )
         self.expert_registry.add_expert("eos", createEOSExpert())
         self.expert_registry.add_expert("text_output", createTextOutputExpert(max_seq_len=20, d_model=dim))
-        self.expert_registry.add_expert("reasoning", createReasoningExpert(num_steps=4, d_model=dim))
 
-        self.local_mem_expert = createLocalMemExpert(d_model=dim)
-        self.expert_registry.add_expert("local_mem", self.local_mem_expert)
-        self.local_mem_expert.set_encoders(
-            text_encoder=self.encoder_registry.get_encoder("text"),
-            vision_encoder=self.encoder_registry.get_encoder("vision"),
-        )
+        if not text_only:
+            self.expert_registry.add_expert("reasoning", createReasoningExpert(num_steps=4, d_model=dim))
 
-        self.internet_search_expert = createInternetSearchExpert(d_model=dim)
-        self.expert_registry.add_expert("internet_search", self.internet_search_expert)
-        self.internet_search_expert.set_encoders(
-            text_encoder=self.encoder_registry.get_encoder("text"),
-        )
+            self.local_mem_expert = createLocalMemExpert(d_model=dim)
+            self.expert_registry.add_expert("local_mem", self.local_mem_expert)
+            self.local_mem_expert.set_encoders(
+                text_encoder=self.encoder_registry.get_encoder("text"),
+                vision_encoder=self.encoder_registry.get_encoder("vision"),
+            )
+
+            self.internet_search_expert = createInternetSearchExpert(d_model=dim)
+            self.expert_registry.add_expert("internet_search", self.internet_search_expert)
+            self.internet_search_expert.set_encoders(
+                text_encoder=self.encoder_registry.get_encoder("text"),
+            )
 
         self.max_steps = max_steps
 
@@ -75,7 +83,9 @@ class MultimodalModel(nn.Module):
         return self.encoder_registry.encode(input, modality, encodings)
     
     def forward(self, encodings):
-        combinedEnc, _ = self.combine(encodings)
+        # EncCombine now returns (latents, num_active, active_mask); the mask is
+        # available here if the router should later attend over it.
+        combinedEnc, _, _ = self.combine(encodings)
         print(f"Combined shape: {combinedEnc.size()}")
 
         artifacts = []

@@ -1,3 +1,8 @@
 torch
 datasets
 sentencepiece
+optuna
+huggingface_hub
+wandb
+pillow
+numpy

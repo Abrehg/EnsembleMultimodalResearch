@@ -117,19 +117,34 @@ class TextEncoder(nn.Module):
         return emb.unsqueeze(0)
 
     def forward(self, input, padding_mask=None):
-        input_ids, _ = self.tokenizer.tokenize_single(input)
-        B, seq_len = input_ids.shape
-        device = input_ids.device
-        
+        device = self.token_embedding.weight.device
+        input_ids, _ = self.tokenizer.tokenize_single(input, device=device)
+        seq_len = input_ids.size(1)
+
         x = self.token_embedding(input_ids) * math.sqrt(self.embed_dim)
-        
+
         pos_emb = self._get_1d_sincos_pos_embed(seq_len, device)
         x = x + pos_emb
-        
+
         x = self.transformer(x, src_key_padding_mask=padding_mask)
         x = self.output_proj(x)
         return x
-    
+
+    def forward_tokens(self, input_ids, padding_mask=None):
+        """Batched forward over pre-tokenized ids [B, L] (padding_mask True at
+        pad positions). Lets callers control tokenization / masking (e.g. MLM)
+        and process a whole batch at once, unlike ``forward`` which tokenizes a
+        single string internally."""
+        device = self.token_embedding.weight.device
+        input_ids = input_ids.to(device)
+        seq_len = input_ids.size(1)
+
+        x = self.token_embedding(input_ids) * math.sqrt(self.embed_dim)
+        x = x + self._get_1d_sincos_pos_embed(seq_len, device)
+        x = self.transformer(x, src_key_padding_mask=padding_mask)
+        x = self.output_proj(x)
+        return x
+
     def load_weights(self, filename):
         state_dict = torch.load(filename)
         self.load_state_dict(state_dict)
