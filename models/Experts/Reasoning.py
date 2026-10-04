@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from typing import Optional
 
 
-def createReasoningExpert(num_steps=8, d_model=512):
+def createReasoningExpert(num_steps=8, d_model=1024):
     return ReasoningExpert(
         d_model=d_model,
         dim_feedforward=d_model * 4,
@@ -214,6 +214,17 @@ class ReasoningExpert(nn.Module):
         self.last_ponder_cost: Optional[torch.Tensor]          = None
         self.last_geometric_confidence: Optional[torch.Tensor] = None
         self.last_kl_loss: Optional[torch.Tensor]              = None
+        # Non-detached siblings of the above, for a training script to use
+        # directly in a loss (e.g. ponder_cost.mean() + kl -- see
+        # reasoning_to_text.py's compute_task_loss). forward()'s return
+        # signature is a fixed contract (OverallModel.forward() unpacks
+        # `output, state = expert(state)`), so these can't be returned
+        # alongside weighted_h without breaking every existing caller --
+        # storing an undetached copy here instead mirrors how
+        # TextOutput.py's _recursive_decode already returns its raw,
+        # graph-carrying ponder_cost directly to the caller.
+        self.last_ponder_cost_raw: Optional[torch.Tensor]      = None
+        self.last_kl_loss_raw: Optional[torch.Tensor]          = None
 
     def set_vae(self, vae: ReasoningVAE):
         """Attach the VAE reasoning block (post-training). Registered as a submodule."""
@@ -312,13 +323,17 @@ class ReasoningExpert(nn.Module):
         self.last_ponder_cost          = ponder_cost.detach()
         self.last_geometric_confidence = geometric_conf.detach()
         self.last_kl_loss              = total_kl.detach()
+        self.last_ponder_cost_raw      = ponder_cost
+        self.last_kl_loss_raw          = total_kl
 
         return None, weighted_h
 
     def store_weights(self, path, filename="reasoning_expert"):
-        os.makedirs(path, exist_ok=True)
-        torch.save(self.state_dict(), os.path.join(path, filename))
+        from weight_io import atomic_torch_save
 
-    def load_weights(self, filepath):
-        state_dict = torch.load(filepath, map_location="cpu")
-        self.load_state_dict(state_dict)
+        os.makedirs(path, exist_ok=True)
+        atomic_torch_save(self.state_dict(), os.path.join(path, filename))
+
+    def load_weights(self, filepath, map_location="cpu", strict=True):
+        state_dict = torch.load(filepath, map_location=map_location)
+        self.load_state_dict(state_dict, strict=strict)

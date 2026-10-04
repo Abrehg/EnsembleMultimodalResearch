@@ -42,7 +42,7 @@ def train_production_spm(corpus_file="train_corpus.txt", vocab_size=32000):
 def createTokenizer():
     return InputTextTokenizer()
 
-def createTextEnc(dim=512):
+def createTextEnc(dim=1024):
     return TextEncoder(vocab_size=32000, embed_dim=dim // 2, output_dim=dim)
 
 class InputTextTokenizer:
@@ -145,14 +145,15 @@ class TextEncoder(nn.Module):
         x = self.output_proj(x)
         return x
 
-    def load_weights(self, filename):
-        state_dict = torch.load(filename)
-        self.load_state_dict(state_dict)
+    def load_weights(self, filename, map_location=None, strict=True):
+        state_dict = torch.load(filename, map_location=map_location)
+        self.load_state_dict(state_dict, strict=strict)
 
     def store_weights(self, path, filename):
-        if not os.path.exists(path):
-            os.makedirs(path, exist_ok=True)
-        torch.save(self.state_dict(), os.path.join(path, filename))
+        from weight_io import atomic_torch_save
+
+        os.makedirs(path, exist_ok=True)
+        atomic_torch_save(self.state_dict(), os.path.join(path, filename))
     
 # # Assuming you have loaded the InputTextTokenizer and TextEncoder
 # tokenizer = createTokenizer()

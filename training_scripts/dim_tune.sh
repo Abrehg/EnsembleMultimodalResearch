@@ -10,14 +10,14 @@
 #SBATCH --qos=dcs-48hr
 
 # --- User-configurable ---
-PROJECT_DIR="/gpfs/u/home/ENMM/ENMMsrtk/barn/research"
+PROJECT_DIR="/gpfs/u/home/ENMM/ENMMsrtk/barn/mul_research"
 PYTHON_SCRIPT_NAME="dim_tune.py"
 VENV_NAME="mulEnv"
 HF_TOKEN="_"
 
 # Optuna dimension-tuning knobs.
-N_TRIALS=20
-MAX_OPT_STEPS=3000
+N_TRIALS=10
+MAX_OPT_STEPS=5000
 TRAIN_EXAMPLES=20000
 EVAL_EXAMPLES=2000
 EVAL_SAMPLES=500
@@ -70,9 +70,12 @@ export HF_HUB_HTTP_TIMEOUT=300
 export REQUESTS_TIMEOUT=300
 
 # --- One-time dataset preparation ---
-# Download + cache TriviaQA into Datasets/ so it persists for future runs.
-# On subsequent jobs this is a no-op that just loads from local disk.
-echo "Ensuring TriviaQA is available locally..."
+# Compile + split the shared multi-task CSVs (text_to_text.py's data
+# pipeline: Minerva Math, DeepMind Mathematics, Logi-Glue, TriviaQA, NQ Open,
+# ASQA) onto scratch so they persist for future runs, including
+# text_to_text.py's own runs. On subsequent jobs this is a no-op that just
+# loads the CSVs already on disk.
+echo "Ensuring the shared multi-task dataset is compiled locally..."
 python "$PYTHON_SCRIPT_PATH" \
     --token "$HF_TOKEN" \
     --prepare_data_only

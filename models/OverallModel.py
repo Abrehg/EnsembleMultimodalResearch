@@ -31,7 +31,7 @@ Modality keys
     - Reasoning module: "reasoning"
 """
 class MultimodalModel(nn.Module):
-    def __init__(self, dim=512, max_steps=10, max_memory_entries=16,
+    def __init__(self, dim=1024, max_steps=10, max_memory_entries=16,
                  text_only=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
 

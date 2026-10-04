@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,6 +33,28 @@ class RoutingLogic(nn.Module):
             encoder_layer, num_layers=num_layers
         )
 
+        # ReZero-style residual scale (Bachlechner et al. 2020, init 0) --
+        # see EncCombine.py's LinearAttentionBlock/HybridLinearEncoderLayer
+        # for the fuller rationale and how this class of fix was diagnosed
+        # (diagnose_state_collapse.py). Once HybridLinearEncoder was fully
+        # neutralized (confirmed an exact identity function at init across
+        # all 10 layers) and AdaptiveAttentionPooling's genuinely-diverse
+        # pooled output was traced through THIS module specifically,
+        # state_encoder's own output collapsed the within/across-source gap
+        # from a still-meaningful 0.0516 down to 0.0003 -- by far the
+        # largest single remaining drop anywhere in the pipeline. Not
+        # surprising in hindsight: state_encoder is the same kind of
+        # standard pre-LN transformer stack (self-attention + FFN, residual
+        # connections) that the encoder's own linear- and full-attention
+        # layers turned out to collapse under, once isolated, despite
+        # looking architecturally unremarkable. nn.TransformerEncoder is a
+        # built-in, opaque multi-layer module (no per-sublayer hook to add
+        # an internal gate the way LinearAttentionBlock has), so this gates
+        # its OUTPUT AS A WHOLE relative to its own input (state stays
+        # exactly its input value at init) rather than each of its 2
+        # internal layers separately.
+        self.state_rezero = nn.Parameter(torch.zeros(1))
+
         self.route_query = nn.Parameter(
             torch.randn(1, 1, d_model) * 0.02
         )
@@ -53,7 +77,7 @@ class RoutingLogic(nn.Module):
     def forward(self, state):
         B = state.size(0)
 
-        state = self.state_encoder(state)
+        state = state + self.state_rezero * (self.state_encoder(state) - state)
 
         query = self.route_query.expand(B, -1, -1)
 
@@ -71,7 +95,17 @@ class RoutingLogic(nn.Module):
             route_vec = F.normalize(route_vec, dim=-1)
 
         return route_vec, state
-    
+
+    def store_weights(self, path, filename="router"):
+        from weight_io import atomic_torch_save
+
+        os.makedirs(path, exist_ok=True)
+        atomic_torch_save(self.state_dict(), os.path.join(path, filename))
+
+    def load_weights(self, filepath, map_location="cpu", strict=True):
+        state_dict = torch.load(filepath, map_location=map_location)
+        self.load_state_dict(state_dict, strict=strict)
+
 # from Encoders.TextEncoder import createTextEnc, createTokenizer
 # from Encoders.VisionEncoder import createVisionEncoder
 # from Encoders.EncCombine import createEncCombine

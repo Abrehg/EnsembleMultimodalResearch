@@ -13,8 +13,7 @@ PAD_ID = 0
 BOS_ID = 2
 EOS_ID = 3
 
-
-def createInternetSearchExpert(d_model=512, max_steps=6, top_k_query=6, n_results=5):
+def createInternetSearchExpert(d_model=1024, max_steps=6, top_k_query=6, n_results=5):
     return InternetSearchExpert(
         d_model=d_model,
         dim_feedforward=d_model * 4,
@@ -22,7 +21,6 @@ def createInternetSearchExpert(d_model=512, max_steps=6, top_k_query=6, n_result
         top_k_query=top_k_query,
         n_results=n_results,
     )
-
 
 # ── Shared expert primitives ──────────────────────────────────────────────────
 
@@ -627,8 +625,10 @@ class InternetSearchExpert(nn.Module):
     # ── Persistence ────────────────────────────────────────────────────────────
 
     def store_weights(self, path, filename="internet_search_expert"):
-        os.makedirs(path, exist_ok=True)
-        torch.save(self.state_dict(), os.path.join(path, filename))
+        from weight_io import atomic_torch_save
 
-    def load_weights(self, filepath):
-        self.load_state_dict(torch.load(filepath, map_location="cpu"))
+        os.makedirs(path, exist_ok=True)
+        atomic_torch_save(self.state_dict(), os.path.join(path, filename))
+
+    def load_weights(self, filepath, map_location="cpu", strict=True):
+        self.load_state_dict(torch.load(filepath, map_location=map_location), strict=strict)

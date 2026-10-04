@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def createLocalMemExpert(d_model=512, top_k_query=6, max_steps=8):
+def createLocalMemExpert(d_model=1024, top_k_query=6, max_steps=8):
     return LocalMemExpert(
         d_model=d_model,
         top_k_query=top_k_query,
@@ -660,12 +660,14 @@ class LocalMemExpert(nn.Module):
 
     def store_weights(self, path, filename="local_mem_expert"):
         """Save learned parameters (nn.Module weights only; use save_stores for data)."""
-        os.makedirs(path, exist_ok=True)
-        torch.save(self.state_dict(), os.path.join(path, filename))
+        from weight_io import atomic_torch_save
 
-    def load_weights(self, filepath):
-        state_dict = torch.load(filepath, map_location="cpu")
-        self.load_state_dict(state_dict)
+        os.makedirs(path, exist_ok=True)
+        atomic_torch_save(self.state_dict(), os.path.join(path, filename))
+
+    def load_weights(self, filepath, map_location="cpu", strict=True):
+        state_dict = torch.load(filepath, map_location=map_location)
+        self.load_state_dict(state_dict, strict=strict)
 
     def save_stores(self, path: str):
         """Persist all three data stores (document embeddings + metadata) to disk."""

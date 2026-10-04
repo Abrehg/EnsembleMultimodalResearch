@@ -3,16 +3,33 @@ Dimension tuning stage for the ensemble multimodal research model.
 
 Goal
 ----
-Find the optimal model ``dimension`` (d_model) for the *overall* model on a
-basic factual QA task (TriviaQA). We use Optuna to search over the candidate
+Find the optimal model ``dimension`` (d_model) for the *overall* model,
+searched across the *same* multi-task mixture text_to_text.py trains on
+(Minerva Math, DeepMind Mathematics, Logi-Glue, TriviaQA, NQ Open, ASQA) --
+not a single narrow QA task. We use Optuna to search over the candidate
 dimensions and optimise *two* objectives simultaneously:
 
-    1. Exact-match accuracy on held-out TriviaQA questions   (maximise)
-    2. FLOPs consumed per example                            (minimise)
+    1. Validation loss across the task mixture (held-out)     (minimise)
+    2. FLOPs consumed per example                              (minimise)
 
 This is a multi-objective study, so Optuna returns a Pareto front of
-(accuracy, flops) trade-offs rather than a single "best" trial. We then apply a
-simple accuracy-per-FLOP heuristic to recommend one dimension.
+(loss, flops) trade-offs rather than a single "best" trial. We then apply a
+simple loss-per-FLOP heuristic to recommend one dimension.
+
+Why the full task mixture, not just TriviaQA
+----------------------------------------------
+An earlier version of this script tuned dimension against TriviaQA alone.
+With a fixed, modest optimizer-step budget, that consistently favoured the
+smallest dimension: larger dimensions need more steps/data to reach a
+comparable loss on any *one* task, so at a fixed step count they mostly just
+looked undertrained while also paying ~10-15x the FLOPs -- a false signal that
+would undersell the capacity actually needed once the model has to cover
+math, logic and long-form QA together. Reusing text_to_text.py's compiled,
+already-shuffled multi-task CSVs (via ``ensure_dataset_ready`` /
+``load_csv_rows``) fixes the *task* mismatch; ``_opt_steps_for_dimension``
+below (quadratic step scaling with dimension) fixes the *undertraining*
+mismatch, so bigger dimensions aren't penalised purely for having had fewer
+effective optimizer steps than they need.
 
 Auxiliary ("dummy") learnable hyperparameters
 ---------------------------------------------
@@ -32,19 +49,27 @@ at the candidate ``dimension`` and threaded through every stage:
 
 Only the text encoder and the text-output expert are active for this stage
 (the non-text encoders/experts are commented out in the model's __init__);
-the registries, combination and router stages are kept intact.
+the registries, combination and router stages are kept intact. Unlike
+text_to_text.py, the text encoder here is trained from scratch at each
+candidate dimension (not the frozen enc_pre.py encoder), since that encoder
+is itself trained at one fixed dimension -- this stage is what decides which
+dimension to train it at in the first place.
 
-TriviaQA is downloaded once from Hugging Face into a plain JSONL file on
-scratch and iterated linearly (no Arrow/DB store), so subsequent runs read it
-straight off disk with no network access. The Optuna study is held in memory
-(no SQLite), so each run starts from scratch with nothing to clear.
+The multi-task CSVs are compiled once (by text_to_text.py's own data
+pipeline) and cached on scratch, so a run here after a text_to_text.py
+``--prepare_data_only`` pass needs no network access. The Optuna study is
+persisted to a small SQLite file on scratch (``STUDY_DB``), so a job that is
+killed by the 48-hour SLURM wall clock can simply be resubmitted and will
+resume from the last completed trial rather than restarting the search from
+scratch (see the comment above ``STUDY_DB`` for the resumability/lightness
+trade-off this makes).
 
-The tuning objective is validation loss / perplexity on the held-out answers
-(minimized), not exact match: a from-scratch model scores ~0 EM on closed-book
-TriviaQA, which is uninformative, whereas loss is continuous and sensitive to
+The tuning objective is validation loss / perplexity on held-out examples
+(minimized), not exact match: a from-scratch model scores ~0 EM on these
+tasks, which is uninformative, whereas loss is continuous and sensitive to
 model capacity -- so the dimension actually shows up in the signal.
 
-Dataset: https://huggingface.co/datasets/mandarjoshi/trivia_qa
+Task mixture: see text_to_text.py's module docstring / SOURCE_LOADERS.
 """
 
 import argparse
@@ -73,45 +98,104 @@ DATA_DIR = os.path.join(SCRATCH_DIR, "dim_tune")
 if MODELS_DIR not in sys.path:
     sys.path.insert(0, MODELS_DIR)
 
-# TriviaQA is cached as plain JSONL (one example per line) and iterated
-# linearly -- no Arrow/DB store. Each line: {"question", "answer", "aliases"}.
-TRIVIAQA_JSONL = {
-    "train": os.path.join(DATA_DIR, "trivia_qa_train.jsonl"),
-    "validation": os.path.join(DATA_DIR, "trivia_qa_validation.jsonl"),
-}
-# How many rows to persist per split on first download (loaders cap further).
-PREP_TRAIN_CAP = 50_000
-PREP_VAL_CAP = 5_000
+# text_to_text.py owns the multi-task data pipeline (download, normalise,
+# shuffle, compile to CSV, stratified train/val split); reused here rather
+# than duplicated so there is one source of truth for the task mixture.
+import text_to_text as t2t
 
-# The Optuna study is kept in-memory (no SQLite) so every run starts fresh --
-# there is no DB to clear. Only the human-readable results summary is written.
+# The Optuna study is persisted to a small SQLite file on scratch (same
+# pattern as enc_pre.py / text_to_text.py's own tuning stages), rather than
+# held in memory: with the multi-task mixture some trials can be slow enough
+# that a full sweep may not fit in one 48-hour SLURM allocation, so a
+# resubmitted job needs to pick up completed trials instead of restarting the
+# whole search. This only checkpoints at *trial* granularity (a trial killed
+# mid-training is lost, not resumed mid-way) -- each trial's cost is already
+# bounded by --max_opt_steps, so that's a small, bounded amount of lost work,
+# and it keeps this change as light as the SQLite file itself. There's no
+# reset flag; delete STUDY_DB manually to start a fresh search.
+STUDY_DB = os.path.join(DATA_DIR, "dim_tune_study.db")
 RESULTS_JSON = os.path.join(DATA_DIR, "dim_tune_results.json")
 
 # Reuse the project's SentencePiece tokenizer so the tuning stage speaks the
 # same vocabulary as the rest of the model.
 TOKENIZER_PATH = os.path.join(MODELS_DIR, "Encoders", "multimodal_bpe.model")
 
-# TriviaQA config: the "no context" reading-comprehension split gives clean
-# (question -> answer) pairs without the heavy Wikipedia/web evidence docs,
-# which is exactly what we want for a basic factual-QA tuning signal.
-TRIVIAQA_HF_NAME = "mandarjoshi/trivia_qa"
-TRIVIAQA_CONFIG = "rc.nocontext"
-
 # --- The primary search dimension ------------------------------------------ #
-DIMENSION_CHOICES = [512, 768, 1024, 1536, 2048]
+DIMENSION_CHOICES = [768, 1024]#[512, 768, 1024, 1536, 2048]
+
+# --- Final-recommendation safety margins ------------------------------------ #
+# This study only ever instantiates text_only=True: the text encoder + the
+# text-output expert. It never sees the vision encoder, memory, reasoning or
+# search experts -- and it certainly never sees the coding/audio/tooling
+# experts planned for later -- yet ``dim`` is shared as one hard,
+# retroactively-unchangeable architectural width across all of them (every
+# future expert is built with ``d_model=dim``). Undersizing costs a full
+# re-train of everything downstream of enc_pre.py; oversizing just costs more
+# compute now. Two knobs compensate for that blind spot:
+#
+#   RECOMMENDATION_*_WEIGHT -- the Pareto recommendation normally trades loss
+#   off against FLOPs at parity; weighting loss higher stops the heuristic
+#   from mechanically picking the cheapest dimension whenever losses happen
+#   to be close (exactly what produced the dim=512 pick from a 15-trial run).
+#
+#   DIMENSION_SAFETY_MARGIN_TIERS -- on top of that, bump the final pick up
+#   this many steps in the DIMENSION_CHOICES ladder, so the recommendation
+#   deliberately overshoots what text-only tasks alone justify. One tier
+#   (e.g. 512 -> 768) roughly matches the working dimensions of common
+#   single-modality baselines outside this repo (audio encoders ~512-1024,
+#   code-model hidden sizes ~768+, tool/function-calling schemas benefiting
+#   from >=768) without jumping straight to a much more expensive tier.
+RECOMMENDATION_LOSS_WEIGHT = 2.0
+RECOMMENDATION_FLOPS_WEIGHT = 0.5
+DIMENSION_SAFETY_MARGIN_TIERS = 1
 
 # --- Auxiliary ("dummy") learnable hyperparameters -------------------------- #
 # Searched jointly with ``dimension`` so each dimension is scored near its own
 # best training configuration. These do not change the *architecture width*;
 # they only govern how each candidate is optimised.
-LR_RANGE = (5e-5, 5e-3)                     # log-uniform
-BATCH_SIZE_CHOICES = [8, 16, 32, 64]        # realised via gradient accumulation
+# Per-dimension log-uniform LR search range: larger dimensions get a
+# narrower, lower range (they're more prone to instability at the LRs a
+# small dimension tolerates fine). Only entries for dimensions actually in
+# DIMENSION_CHOICES are ever looked up -- one not under test is simply
+# never used (see _lr_range_for_dimension).
+LR_RANGES = {
+    512:  (1e-4, 1e-3),
+    768:  (2e-4, 2e-3),
+    1024: (5e-5, 5e-4),
+    1536: (1e-5, 2e-4),
+    2048: (1e-5, 1e-4),
+}
+BATCH_SIZE_CHOICES = [32]#[8, 16, 32, 64]        # realised via gradient accumulation
 WEIGHT_DECAY_RANGE = (1e-5, 1e-1)           # log-uniform
-WARMUP_CHOICES = [0, 10, 50]                # optimizer-step linear warmup
-LABEL_SMOOTHING_CHOICES = [0.0, 0.1]
+WARMUP_CHOICES = [50]#[0, 10, 50]                # optimizer-step linear warmup
+LABEL_SMOOTHING_CHOICES = [0.1]#[0.0, 0.1]
 
-MAX_SRC_LEN = 48       # question length cap (tokens)
-MAX_TGT_LEN = 24       # answer length cap (tokens)
+MAX_SRC_LEN = 48       # question length cap (tokens; FLOPs-estimate only)
+MAX_TGT_LEN = 32       # answer length cap (tokens) -- bumped from 24 so
+                       # longer-form targets (ASQA, logic explanations) in
+                       # the shared task mixture aren't over-truncated
+
+# Larger dimensions need more optimizer steps to reach a comparable loss than
+# smaller ones do; scaling the per-trial step budget with dimension keeps
+# big-vs-small comparisons fairer (see docstring above). Quadratic, uncapped:
+# a dimension 4x the base (e.g. 2048 vs. 512) gets 16x the step budget.
+STEP_SCALE_BASE_DIM = 512
+
+
+def _opt_steps_for_dimension(base_steps, dimension):
+    mult = max(1.0, (dimension / STEP_SCALE_BASE_DIM) ** 2)
+    return int(base_steps * mult)
+
+
+def _lr_range_for_dimension(dimension):
+    if dimension in LR_RANGES:
+        return LR_RANGES[dimension]
+    print(f"[warn] no LR range configured for dimension={dimension} in "
+          f"LR_RANGES; falling back to the broadest configured range")
+    lows = [r[0] for r in LR_RANGES.values()]
+    highs = [r[1] for r in LR_RANGES.values()]
+    return (min(lows), max(highs))
+
 
 # SentencePiece special ids (see TextEncoder.createTokenizer / spm training).
 PAD_ID = 0
@@ -141,65 +225,32 @@ def exact_match(prediction: str, gold_aliases) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Dataset preparation: download once into plain JSONL on scratch, then iterate
-# it linearly. No Arrow / DB store.
+# Dataset preparation: delegate entirely to text_to_text.py's data pipeline
+# (download, normalise, shuffle, compile to CSV, stratified train/val split),
+# then adapt its {input, target, source, aux} rows into the (question, answer,
+# aliases) tuples the rest of this file already expects.
 # --------------------------------------------------------------------------- #
-def _row_to_record(row):
-    """Extract {question, answer, aliases} from a raw TriviaQA row, or None."""
-    answer = row["answer"]
-    value = answer.get("value") or ""
-    aliases = list(answer.get("aliases") or [])
-    aliases += list(answer.get("normalized_aliases") or [])
-    if value:
-        aliases.append(value)
-    aliases = [a for a in dict.fromkeys(aliases) if a]   # de-dup, keep order
-    if not value or not aliases:
-        return None
-    return {"question": row["question"], "answer": value, "aliases": aliases}
+def prepare_task_mixture():
+    """Compile + split the shared multi-task CSVs (no-op if already cached)."""
+    t2t.ensure_dataset_ready()
 
 
-def prepare_triviaqa():
-    """Stream TriviaQA from Hugging Face and write each split to a JSONL file on
-    scratch (one JSON record per line). No-op if the files already exist."""
-    from datasets import load_dataset
-
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-    if all(os.path.isfile(p) for p in TRIVIAQA_JSONL.values()):
-        print("[data] TriviaQA JSONL already present on scratch.")
-        return
-
-    caps = {"train": PREP_TRAIN_CAP, "validation": PREP_VAL_CAP}
-    for split, path in TRIVIAQA_JSONL.items():
-        print(f"[data] Downloading {TRIVIAQA_HF_NAME} ({TRIVIAQA_CONFIG}) "
-              f"split='{split}' -> {path}")
-        stream = load_dataset(
-            TRIVIAQA_HF_NAME, TRIVIAQA_CONFIG, split=split, streaming=True,
-        )
-        written = 0
-        with open(path, "w") as f:
-            for row in stream:
-                rec = _row_to_record(row)
-                if rec is None:
-                    continue
-                f.write(json.dumps(rec) + "\n")
-                written += 1
-                if written >= caps[split]:
-                    break
-        print(f"[data]   wrote {written} records")
+def _rows_to_examples(rows):
+    examples = []
+    for r in rows:
+        aliases = [a for a in (r.get("aux") or "").split("|") if a] or [r["target"]]
+        examples.append((r["input"], r["target"], aliases))
+    return examples
 
 
 def load_examples(split, limit=None):
-    """Read a JSONL split linearly into a list of (question, answer, aliases)."""
-    path = TRIVIAQA_JSONL[split]
-    examples = []
-    with open(path) as f:
-        for i, line in enumerate(f):
-            if limit is not None and i >= limit:
-                break
-            obj = json.loads(line)
-            examples.append((obj["question"], obj["answer"], obj["aliases"]))
-    return examples
+    """Load a (question, answer, aliases) sample from text_to_text.py's
+    compiled train/val CSVs. ``limit`` caps how many rows are sampled."""
+    path = t2t.TRAIN_CSV if split == "train" else t2t.VAL_CSV
+    rows = t2t.load_csv_rows(path)
+    if limit is not None:
+        rows = t2t.sample_rows(rows, limit, seed=0 if split == "train" else 1)
+    return _rows_to_examples(rows)
 
 
 # --------------------------------------------------------------------------- #
@@ -292,11 +343,16 @@ def train_and_evaluate(dimension, hp, train_examples, eval_examples, codec,
     hyperparameters ``hp``, and return (val_loss, flops_per_example)."""
     from models.OverallModel import MultimodalModel
 
+    # Bigger dimensions get quadratically more optimizer steps, so they
+    # aren't undersold purely for being undertrained at a fixed step budget
+    # (see module docstring).
+    effective_steps = _opt_steps_for_dimension(max_opt_steps, dimension)
+
     print(
         f"\n[trial] dimension={dimension} | lr={hp['learning_rate']:.2e} "
         f"| batch={hp['batch_size']} | wd={hp['weight_decay']:.2e} "
         f"| warmup={hp['warmup_steps']} | ls={hp['label_smoothing']} "
-        f"| device={device}"
+        f"| opt_steps={effective_steps} (base={max_opt_steps}) | device={device}"
     )
     torch.manual_seed(0)
 
@@ -327,7 +383,7 @@ def train_and_evaluate(dimension, hp, train_examples, eval_examples, codec,
     optimizer.zero_grad()
     accum, opt_step, ex_idx = 0, 0, 0
     running_loss = 0.0
-    while opt_step < max_opt_steps:
+    while opt_step < effective_steps:
         question, answer, _ = train_examples[ex_idx % n]
         ex_idx += 1
 
@@ -352,9 +408,9 @@ def train_and_evaluate(dimension, hp, train_examples, eval_examples, codec,
             optimizer.zero_grad()
             accum = 0
             opt_step += 1
-            if opt_step % max(1, max_opt_steps // 5) == 0:
+            if opt_step % max(1, effective_steps // 5) == 0:
                 avg = running_loss / batch_size
-                print(f"  opt-step {opt_step:4d}/{max_opt_steps}  loss={avg:.4f}")
+                print(f"  opt-step {opt_step:4d}/{effective_steps}  loss={avg:.4f}")
             running_loss = 0.0
 
     # ---- Evaluation: validation loss (teacher-forced CE) on held-out answers #
@@ -407,7 +463,7 @@ def run_study(args):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    prepare_triviaqa()
+    prepare_task_mixture()
     train_examples = load_examples("train", limit=args.train_examples)
     eval_examples = load_examples("validation", limit=args.eval_examples)
     print(
@@ -422,7 +478,7 @@ def run_study(args):
         # Auxiliary "dummy" learnable hyperparameters.
         hp = {
             "learning_rate": trial.suggest_float(
-                "learning_rate", *LR_RANGE, log=True
+                "learning_rate", *_lr_range_for_dimension(dimension), log=True
             ),
             "batch_size": trial.suggest_categorical(
                 "batch_size", BATCH_SIZE_CHOICES
@@ -446,17 +502,50 @@ def run_study(args):
         trial.set_user_attr("perplexity", math.exp(min(val_loss, 20.0)))
         return val_loss, flops
 
-    # In-memory study (no SQLite storage) -> every run starts fresh; there is
-    # nothing to clear between runs. NSGA-II explores dimension + auxiliary
-    # hyperparameters and converges on the (loss, FLOPs) Pareto front.
+    # SQLite-backed study (see STUDY_DB comment above) so a resubmitted job
+    # resumes from the last completed trial instead of restarting the whole
+    # search. NSGA-II explores dimension + auxiliary hyperparameters and
+    # converges on the (loss, FLOPs) Pareto front; it reconstructs its
+    # generation state from the trials already in storage on reload.
+    os.makedirs(DATA_DIR, exist_ok=True)
     sampler = optuna.samplers.NSGAIISampler(seed=0)
     study = optuna.create_study(
+        study_name="dim_tune",
+        storage=f"sqlite:///{STUDY_DB}",
         directions=["minimize", "minimize"],  # val loss down, FLOPs down
         sampler=sampler,
+        load_if_exists=True,
     )
-    study.optimize(objective, n_trials=args.n_trials)
+    # --n_trials is the *target total* completed trials for the whole study,
+    # not "how many more to run this invocation" -- otherwise every
+    # resubmission after a SLURM timeout keeps adding n_trials more forever
+    # instead of the search ever finishing. Only COMPLETE trials count
+    # towards that total; a trial killed mid-training by the wall clock is
+    # left behind in the DB as RUNNING/FAIL and is simply retried, not
+    # counted as done.
+    n_done = len(study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,)))
+    n_remaining = max(0, args.n_trials - n_done)
+    if n_done:
+        print(f"[resume] loaded existing study from {STUDY_DB} "
+              f"({n_done} trial(s) already completed)")
+    if n_remaining == 0:
+        print(f"[resume] study already has {n_done} completed trial(s) "
+              f">= target --n_trials={args.n_trials}; nothing to do.")
+    else:
+        print(f"[resume] running {n_remaining} more trial(s) to reach "
+              f"target --n_trials={args.n_trials}")
+        study.optimize(objective, n_trials=n_remaining)
 
     report_results(study)
+
+
+def _bump_dimension(dimension, tiers):
+    """Shift ``dimension`` up by ``tiers`` steps in the fixed DIMENSION_CHOICES
+    ladder, clamped at the top. Applies the safety margin described above
+    DIMENSION_SAFETY_MARGIN_TIERS on top of the raw score-based pick."""
+    sorted_dims = sorted(DIMENSION_CHOICES)
+    idx = sorted_dims.index(dimension)
+    return sorted_dims[min(idx + tiers, len(sorted_dims) - 1)]
 
 
 def _pareto_front(points):
@@ -523,10 +612,12 @@ def report_results(study):
             f"FLOPs/ex={r['flops_per_example']:.3e}"
         )
 
-    # Single recommendation: among Pareto-optimal dimensions, the best balance
-    # of accuracy (low loss) and efficiency (low FLOPs), scored on min-max
-    # normalized [0,1] loss + FLOPs (lower is better on both).
-    recommended = None
+    # Score-based pick: among Pareto-optimal dimensions, the best balance of
+    # accuracy (low loss) and efficiency (low FLOPs), scored on min-max
+    # normalized [0,1] loss + FLOPs -- weighted so loss dominates FLOPs (see
+    # RECOMMENDATION_*_WEIGHT above), since this study can't see the future
+    # experts that will also have to live inside this dimension.
+    scored_pick = None
     if pareto:
         losses = [r["val_loss"] for r in pareto]
         flps = [r["flops_per_example"] for r in pareto]
@@ -536,21 +627,45 @@ def report_results(study):
         def _score(r):
             nl = (r["val_loss"] - lo_l) / (hi_l - lo_l) if hi_l > lo_l else 0.0
             nf = (r["flops_per_example"] - lo_f) / (hi_f - lo_f) if hi_f > lo_f else 0.0
-            return nl + nf                      # lower is better on both axes
+            return RECOMMENDATION_LOSS_WEIGHT * nl + RECOMMENDATION_FLOPS_WEIGHT * nf
 
-        recommended = min(pareto, key=_score)
+        scored_pick = min(pareto, key=_score)
         print(
-            f"\nRecommended dimension: {recommended['dimension']} "
-            f"(val_loss={recommended['val_loss']:.4f}, "
-            f"ppl={recommended['perplexity']:.2f}, "
-            f"FLOPs/ex={recommended['flops_per_example']:.3e}, "
-            f"hp={recommended['best_hparams']})"
+            f"\nScore-based pick (loss weighted {RECOMMENDATION_LOSS_WEIGHT}x vs "
+            f"FLOPs {RECOMMENDATION_FLOPS_WEIGHT}x): dimension={scored_pick['dimension']} "
+            f"(val_loss={scored_pick['val_loss']:.4f}, "
+            f"ppl={scored_pick['perplexity']:.2f}, "
+            f"FLOPs/ex={scored_pick['flops_per_example']:.3e}, "
+            f"hp={scored_pick['best_hparams']})"
         )
+
+    # Final recommendation: the score-based pick, bumped up by a fixed safety
+    # margin in the DIMENSION_CHOICES ladder so the answer stays realistic
+    # for the untested future experts (vision/memory/reasoning/search now,
+    # coding/audio/tooling later) that will share this same dimension.
+    recommended_dimension = None
+    if scored_pick:
+        recommended_dimension = _bump_dimension(
+            scored_pick["dimension"], DIMENSION_SAFETY_MARGIN_TIERS
+        )
+        if recommended_dimension == scored_pick["dimension"]:
+            print(f"Recommended dimension: {recommended_dimension} "
+                  f"(already at the top of DIMENSION_CHOICES; no margin to add)")
+        else:
+            print(f"Recommended dimension: {recommended_dimension} "
+                  f"(+{DIMENSION_SAFETY_MARGIN_TIERS} tier safety margin over the "
+                  f"score-based pick of {scored_pick['dimension']}, for future experts "
+                  f"this study doesn't test)")
 
     results = {
         "dimension_choices": DIMENSION_CHOICES,
+        "recommendation_weights": {
+            "loss_weight": RECOMMENDATION_LOSS_WEIGHT,
+            "flops_weight": RECOMMENDATION_FLOPS_WEIGHT,
+            "safety_margin_tiers": DIMENSION_SAFETY_MARGIN_TIERS,
+        },
         "auxiliary_search_space": {
-            "learning_rate": LR_RANGE,
+            "learning_rate_by_dimension": LR_RANGES,
             "batch_size": BATCH_SIZE_CHOICES,
             "weight_decay": WEIGHT_DECAY_RANGE,
             "warmup_steps": WARMUP_CHOICES,
@@ -558,7 +673,8 @@ def report_results(study):
         },
         "per_dimension": per_dim,
         "pareto_front": pareto,
-        "recommended": recommended,
+        "scored_pick": scored_pick,
+        "recommended_dimension": recommended_dimension,
     }
     with open(RESULTS_JSON, "w") as f:
         json.dump(results, f, indent=2)
@@ -573,20 +689,26 @@ def parse_args():
     # Accepted for compatibility with the shared SLURM launch template.
     p.add_argument("--token", default="_", help="Hugging Face token.")
     p.add_argument("--n_trials", type=int, default=15,
-                   help="Optuna trials this run (in-memory study, always fresh). "
-                        "Dimension is the variable of interest, so a small "
-                        "number suffices.")
+                   help="Target TOTAL completed trials for the persisted "
+                        "study (STUDY_DB), not 'more trials this run' -- a "
+                        "resubmitted job only runs however many are still "
+                        "needed to reach this count, then stops.")
     p.add_argument("--train_examples", type=int, default=20000,
-                   help="Cap on TriviaQA training examples read from JSONL.")
+                   help="Cap on training examples sampled from the compiled "
+                        "multi-task CSV (see text_to_text.py).")
     p.add_argument("--eval_examples", type=int, default=2000,
-                   help="Cap on TriviaQA eval examples read from JSONL.")
+                   help="Cap on eval examples sampled from the compiled "
+                        "multi-task CSV (see text_to_text.py).")
     p.add_argument("--max_opt_steps", type=int, default=3000,
-                   help="Optimizer steps per trial "
-                        "(each step accumulates that trial's batch size).")
+                   help="Base optimizer-step budget per trial at "
+                        "STEP_SCALE_BASE_DIM; larger dimensions get a "
+                        "quadratically scaled-up budget (see docstring) -- "
+                        "e.g. 4x the base dimension gets 16x the steps.")
     p.add_argument("--eval_samples", type=int, default=500,
                    help="Number of eval examples scored for validation loss.")
     p.add_argument("--prepare_data_only", action="store_true",
-                   help="Download TriviaQA to JSONL on scratch, then exit.")
+                   help="Compile + split the shared multi-task CSVs "
+                        "(text_to_text.py's data pipeline), then exit.")
     return p.parse_args()
 
 
@@ -604,7 +726,7 @@ def main():
             print(f"[hf] login skipped: {e}")
 
     if args.prepare_data_only:
-        prepare_triviaqa()
+        prepare_task_mixture()
         print("[data] Preparation complete.")
         return
 

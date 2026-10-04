@@ -8,7 +8,7 @@ from Encoders.EncCombine import EncodingCombination
 from Logic import RoutingLogic
 
 
-def create_registry(dim=512):
+def create_registry(dim=1024):
     return ExpertRegistry(route_dim=dim // 4)
 
 
@@ -276,17 +276,32 @@ class ExpertRegistry(nn.Module):
     # Persistence
     # ─────────────────────────────────────────────────────────────────────────
 
-    def store_weights(self, path, filename="expert_registry"):
+    def store_weights(self, path, filename="expert_registry", extra=None):
+        """``extra``: an optional, arbitrary, picklable payload stored
+        alongside the registry's own weights/metadata -- e.g. a training
+        script's optimizer state + epoch/batch/step counters, so a
+        checkpoint intended purely for mid-run resume doesn't need its own
+        separate file. Omit it (default None) for a plain, portable weights
+        file meant for another script to load standalone -- ``load_weights``
+        returns None when no ``extra`` was stored, so existing callers that
+        don't capture the return value are unaffected."""
+        from weight_io import atomic_torch_save
+
         os.makedirs(path, exist_ok=True)
         checkpoint = {
             "state_dict": self.state_dict(),
             "expert_names": self.expert_names,
             "route_dim": self.route_dim,
         }
-        torch.save(checkpoint, os.path.join(path, filename))
+        if extra is not None:
+            checkpoint["extra"] = extra
+        atomic_torch_save(checkpoint, os.path.join(path, filename))
 
-    def load_weights(self, filepath, strict=True):
-        checkpoint = torch.load(filepath, map_location="cpu")
+    def load_weights(self, filepath, map_location="cpu", strict=True):
+        """Returns whatever ``extra`` payload ``store_weights`` was called
+        with (None if none was stored) -- callers that only want the
+        weights (the common case) can simply ignore the return value."""
+        checkpoint = torch.load(filepath, map_location=map_location)
 
         saved_names = checkpoint["expert_names"]
         saved_dim = checkpoint["route_dim"]
@@ -317,3 +332,5 @@ class ExpertRegistry(nn.Module):
                 print(f"  New (randomly initialised): {len(missing)} params")
             if unexpected:
                 print(f"  Skipped (removed experts):  {len(unexpected)} params")
+
+        return checkpoint.get("extra")

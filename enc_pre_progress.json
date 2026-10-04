@@ -1,0 +1,8 @@
+{
+  "completed": [
+    "text_tune",
+    "text_train",
+    "ocr_tune",
+    "ocr_train"
+  ]
+}

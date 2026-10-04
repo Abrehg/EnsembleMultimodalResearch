@@ -11,7 +11,7 @@ BOS_ID = 2
 EOS_ID = 3
 
 
-def createTextOutputExpert(max_seq_len=10000, vocab_size=32000, d_model=512, max_recursive_steps=6):
+def createTextOutputExpert(max_seq_len=10000, vocab_size=32000, d_model=1024, max_recursive_steps=6):
     return TextOutputExpert(
         vocab_size=vocab_size,
         d_model=d_model,
@@ -259,6 +259,8 @@ class TextOutputExpert(nn.Module):
         max_length: Optional[int] = None,
         temperature: float = 1.0,
         top_k: int = 50,
+        return_logprob: bool = False,
+        return_entropy: bool = False,
     ):
         """
         Args:
@@ -267,11 +269,34 @@ class TextOutputExpert(nn.Module):
             max_length     : token generation budget (defaults to max_seq_len)
             temperature    : sampling temperature
             top_k          : top-k filtering; 0 disables
+            return_logprob : if True, also return each sequence's summed
+                             log-prob (graph-carrying, for a REINFORCE-style
+                             policy-gradient loss -- see reasoning_to_text.py's
+                             RL stage). False by default so every existing
+                             caller (evaluate_rewards, self_correct_step,
+                             OverallModel.forward()) keeps getting the same
+                             2-tuple it always has.
+            return_entropy : if True (requires return_logprob=True), also
+                             return each sequence's summed per-step sampling
+                             entropy (graph-carrying) -- see text_to_text.py's
+                             t2t_rl_term, which uses this as an anti-collapse
+                             bonus. False by default so every existing
+                             return_logprob=True caller (reasoning_to_text.py's
+                             reasoning_rl_term and its reasoning_rl stage)
+                             keeps getting the same 3-tuple it always has.
 
         Returns:
             text  : list[str]  decoded output sequences
             state : [B, K, D]  updated latent state
+            logprob : [B]  (only when return_logprob=True) summed log-prob of
+                      the sampled tokens, masked past each sequence's EOS
+            entropy : [B]  (only when return_logprob=True and
+                      return_entropy=True) summed per-step sampling entropy,
+                      masked past each sequence's EOS
         """
+        if return_entropy and not return_logprob:
+            raise ValueError("return_entropy requires return_logprob=True "
+                             "(entropy is only meaningful alongside a logprob-based RL loss)")
         if max_length is None:
             max_length = self.max_seq_len
 
@@ -282,6 +307,8 @@ class TextOutputExpert(nn.Module):
         generated         = torch.full((B, 1), BOS_ID, dtype=torch.long, device=device)
         finished          = torch.zeros(B, dtype=torch.bool, device=device)
         total_ponder_cost = torch.zeros(B, device=device)
+        total_logprob     = torch.zeros(B, device=device)
+        total_entropy     = torch.zeros(B, device=device)
         last_decoded      = state  # fallback for zero-length generation
 
         for _ in range(max_length):
@@ -307,6 +334,12 @@ class TextOutputExpert(nn.Module):
 
             probs      = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
+            if return_logprob:
+                token_logprob = torch.log(probs.gather(1, next_token).squeeze(-1) + 1e-8)
+                total_logprob = total_logprob + token_logprob * (~finished).float()
+            if return_entropy:
+                token_entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)
+                total_entropy = total_entropy + token_entropy * (~finished).float()
             next_token = next_token.masked_fill(finished.unsqueeze(-1), PAD_ID)
             generated  = torch.cat([generated, next_token], dim=1)
 
@@ -330,12 +363,18 @@ class TextOutputExpert(nn.Module):
         self.last_geometric_confidence = geometric_conf.detach()
 
         text = self.tokenizer.detokenize(generated, strip_special=False)
+        if return_logprob and return_entropy:
+            return text, state, total_logprob, total_entropy
+        if return_logprob:
+            return text, state, total_logprob
         return text, state
 
     def store_weights(self, path, filename="text_output_expert"):
-        os.makedirs(path, exist_ok=True)
-        torch.save(self.state_dict(), os.path.join(path, filename))
+        from weight_io import atomic_torch_save
 
-    def load_weights(self, filepath):
-        state_dict = torch.load(filepath, map_location="cpu")
-        self.load_state_dict(state_dict)
+        os.makedirs(path, exist_ok=True)
+        atomic_torch_save(self.state_dict(), os.path.join(path, filename))
+
+    def load_weights(self, filepath, map_location="cpu", strict=True):
+        state_dict = torch.load(filepath, map_location=map_location)
+        self.load_state_dict(state_dict, strict=strict)

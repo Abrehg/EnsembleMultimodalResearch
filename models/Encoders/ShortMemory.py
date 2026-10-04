@@ -201,10 +201,12 @@ class ShortMemory(nn.Module):
     # ──────────────────────────────────────────────────────────────────
 
     def store_weights(self, path, filename="short_memory.pt"):
-        os.makedirs(path, exist_ok=True)
-        torch.save(self.state_dict(), os.path.join(path, filename))
+        from weight_io import atomic_torch_save
 
-    def load_weights(self, filepath):
-        state_dict = torch.load(filepath, map_location="cpu")
-        self.load_state_dict(state_dict)
+        os.makedirs(path, exist_ok=True)
+        atomic_torch_save(self.state_dict(), os.path.join(path, filename))
+
+    def load_weights(self, filepath, map_location="cpu", strict=True):
+        state_dict = torch.load(filepath, map_location=map_location)
+        self.load_state_dict(state_dict, strict=strict)
         self._cells = []    # runtime cells are not persisted

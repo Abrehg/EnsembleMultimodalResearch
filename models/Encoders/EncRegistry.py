@@ -2,7 +2,7 @@ import os
 import torch
 import torch.nn as nn
 
-def createEncRegistry(dim=512):
+def createEncRegistry(dim=1024):
     return EncoderRegistry(d_model=dim)
 
 class EncoderRegistry(nn.Module):
@@ -21,9 +21,24 @@ class EncoderRegistry(nn.Module):
             )
 
         self.encoders[modality] = module
-        self.modality_embeddings[modality] = nn.Parameter(
-            torch.randn(1, 1, self.d_model) * 0.02
-        )
+        # Match whatever device `module` itself already lives on, rather
+        # than always defaulting to CPU: add_encoder() is called a second
+        # time (remove_encoder() then add_encoder() again) by callers like
+        # text_to_text.py's build_model(), which swaps in a frozen wrapper
+        # *after* the surrounding model's own .to(device) call already ran
+        # -- a plain torch.randn(...) here would silently strand this
+        # modality's embedding on CPU while every other tensor in the
+        # forward pass is on the GPU, raising a "same device" RuntimeError
+        # only once real training data flows through it (never on a CPU-only
+        # smoke test, which is exactly why this stayed latent).
+        try:
+            device = next(module.parameters()).device
+        except StopIteration:
+            device = None       # parameter-free module -- nothing to match
+        embedding = torch.randn(1, 1, self.d_model) * 0.02
+        if device is not None:
+            embedding = embedding.to(device)
+        self.modality_embeddings[modality] = nn.Parameter(embedding)
 
         print(f"Registered encoder for modality '{modality}'")
 
@@ -72,17 +87,19 @@ class EncoderRegistry(nn.Module):
         return encodings
 
     def store_weights(self, path, filename="encoder_registry"):
+        from weight_io import atomic_torch_save
+
         os.makedirs(path, exist_ok=True)
         checkpoint = {
             "state_dict": self.state_dict(),
             "modalities": self.modalities,
         }
-        torch.save(checkpoint, os.path.join(path, filename))
+        atomic_torch_save(checkpoint, os.path.join(path, filename))
         print(f"Saved encoder registry ({len(self.encoders)} encoders) "
               f"to {path}/{filename}")
 
-    def load_weights(self, filepath, strict=True):
-        checkpoint = torch.load(filepath, map_location="cpu")
+    def load_weights(self, filepath, map_location="cpu", strict=True):
+        checkpoint = torch.load(filepath, map_location=map_location)
 
         if strict:
             saved = checkpoint["modalities"]

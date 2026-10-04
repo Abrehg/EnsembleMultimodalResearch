@@ -6,3 +6,4 @@ huggingface_hub
 wandb
 pillow
 numpy
+pypdfium2
